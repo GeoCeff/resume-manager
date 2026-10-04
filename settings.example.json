@@ -1,0 +1,8 @@
+{
+  "DataRoot": "%LOCALAPPDATA%\\ResumeManager\\Data",
+  "PrivateContact": "public@example.com | personal@example.com | 00000000000 | Example City",
+  "PublicContact": "public@example.com | Example City",
+  "ContactAnchor": "public@example.com",
+  "PrivateOnly": ["personal@example.com", "00000000000"],
+  "WebsitePublicPath": ""
+}

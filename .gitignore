@@ -1,0 +1,20 @@
+# Deny everything by default. Only program source and fake examples are tracked.
+*
+!.gitignore
+!.gitattributes
+!README.md
+!Resume Manager.cmd
+!requirements.txt
+!settings.example.json
+!Scripts/
+Scripts/*
+!Scripts/Resume Manager.ps1
+!Scripts/resume_settings.ps1
+!Scripts/resume_update_workflow.ps1
+!Scripts/update_resume_projects.py
+!Scripts/check_repository.ps1
+!Scripts/test_resume_program.py
+!.githooks/
+.githooks/*
+!.githooks/pre-commit
+!.githooks/pre-push

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File Scripts/check_repository.ps1 -History
