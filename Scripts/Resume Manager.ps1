@@ -1,16 +1,25 @@
 param([switch]$SelfTest, [switch]$LoadOnly, [string]$ConfigPath = $env:RESUME_MANAGER_CONFIG)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'manager_dialogs.ps1')
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) { $ConfigPath = Join-Path $env:LOCALAPPDATA 'ResumeManager\settings.local.json' }
+$CreatedNew = $false
+$Mutex = New-Object System.Threading.Mutex($true, 'ResumeManager.Application', [ref]$CreatedNew)
+if (-not $CreatedNew) {
+    [void][Windows.Forms.MessageBox]::Show('Resume Manager is already running.','Resume Manager')
+    $Mutex.Dispose(); exit 0
+}
 
-try {
-    . (Join-Path $PSScriptRoot 'resume_settings.ps1') -ConfigPath $ConfigPath
+while ($true) {
+    $StartupIssue = Get-StartupIssue $ConfigPath
+    if($StartupIssue.Kind -eq 'Ready'){break}
+    if($SelfTest -or $LoadOnly){$Mutex.ReleaseMutex();$Mutex.Dispose();throw ($StartupIssue.Message + "`n" + $StartupIssue.Details)}
+    $Choice = if($StartupIssue.Kind -eq 'Setup'){'Edit settings'}else{Show-StartupRecovery $StartupIssue}
+    if($Choice -eq 'Retry'){continue}
+    if($Choice -eq 'Cancel' -or -not (Show-SettingsDialog $ConfigPath $null)){$Mutex.ReleaseMutex();$Mutex.Dispose();exit 0}
 }
-catch {
-    if ($SelfTest -or $LoadOnly) { throw }
-    Add-Type -AssemblyName System.Windows.Forms
-    [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Resume Manager - Setup')
-    exit 1
-}
+. (Join-Path $PSScriptRoot 'resume_settings.ps1') -ConfigPath $ConfigPath
+$PythonExe = $StartupIssue.Python
 $WorkflowPath = Join-Path $PSScriptRoot "resume_update_workflow.ps1"
 $PowerShellExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
 $SessionRoot = Join-Path $env:TEMP 'ResumeManagerSessions'
@@ -48,6 +57,9 @@ if ($SelfTest) {
     if (-not (Test-ArchiveNeeded -CurrentHash "new" -ArchivedHash "old")) {
         throw "Changed files must create a new archive"
     }
+    $Policy = New-ContactPolicy @('public@example.com','personal@example.com','Example City') @('public@example.com','Example City') @('personal@example.com')
+    if($Policy.PublicContact -match 'personal@' -or (Test-PublicContactField '000-0000-0000' @('00000000000'))){throw 'Public contact policy failed'}
+    if((Get-StartupIssue (Join-Path $env:TEMP ([guid]::NewGuid().ToString('N')+'.json'))).Kind -ne 'Setup'){throw 'Missing settings must be first-run setup'}
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     $TestForm = New-Object System.Windows.Forms.Form
@@ -55,26 +67,15 @@ if ($SelfTest) {
     $TestWatcher = New-Object System.IO.FileSystemWatcher($CurrentDir, "*.docx")
     $TestWatcher.Dispose()
     $TestWord = New-Object -ComObject Word.Application
-    try { $TestWord.Quit() } finally { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($TestWord) }
+    try { if($TestWord.Documents.Count -eq 0){$TestWord.Quit()} } finally { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($TestWord) }
     Write-Output "Resume Manager self-test passed. Latest archive: $(Get-LatestArchive)"
+    $Mutex.ReleaseMutex(); $Mutex.Dispose()
     exit 0
 }
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
-
-$CreatedNew = $false
-$Mutex = New-Object System.Threading.Mutex($true, 'ResumeManager.Application', [ref]$CreatedNew)
-if (-not $CreatedNew) {
-    [System.Windows.Forms.MessageBox]::Show(
-        "Resume Manager is already running.",
-        "Resume Manager",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Information
-    ) | Out-Null
-    exit 0
-}
 
 $script:SessionActive = $false
 $script:WorkingPath = $null
@@ -92,97 +93,146 @@ $script:ArchiveStdout = $null
 $script:ArchiveStderr = $null
 $script:WordClosed = $false
 $script:LastFailedHash = $null
+$script:LastErrorDetail = ''
+$script:RecoveryPath = $Root
+$script:ArchiveStarted = [datetime]::MinValue
+$script:ArchiveProgress = $null
+$script:StallShown = $false
+$script:Restoring = $false
 
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = "Resume Manager"
 $Form.StartPosition = "CenterScreen"
-$Form.ClientSize = New-Object System.Drawing.Size(520, 330)
-$Form.FormBorderStyle = "FixedDialog"
-$Form.MaximizeBox = $false
-$Form.BackColor = [System.Drawing.Color]::White
+$Form.ClientSize = New-Object System.Drawing.Size(720, 540)
+$Form.MinimumSize = New-Object System.Drawing.Size(680,560)
+$Form.Font = New-Object Drawing.Font('Segoe UI',10)
+$Form.AutoScaleMode = 'Font'
+$Form.BackColor = [Drawing.SystemColors]::Window
+$Form.ForeColor = [Drawing.SystemColors]::WindowText
+$Form.KeyPreview = $true
+$MainLayout = New-Object Windows.Forms.TableLayoutPanel
+$MainLayout.Dock = 'Fill'; $MainLayout.Padding = New-Object Windows.Forms.Padding(20)
+$MainLayout.ColumnCount = 1; $MainLayout.AutoScroll = $true
+$Form.Controls.Add($MainLayout)
 
 $Title = New-Object System.Windows.Forms.Label
 $Title.Text = "Resume Manager"
 $Title.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
 $Title.AutoSize = $true
-$Title.Location = New-Object System.Drawing.Point(28, 22)
-$Form.Controls.Add($Title)
+$MainLayout.Controls.Add($Title)
 
 $Intro = New-Object System.Windows.Forms.Label
-$Intro.Text = "Edit in Word. Saved changes become dated private and public versions."
+$Intro.Text = "Edit either version in Word. Saved content updates both; contacts stay separate."
 $Intro.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $Intro.AutoSize = $true
-$Intro.Location = New-Object System.Drawing.Point(31, 61)
-$Form.Controls.Add($Intro)
+$Intro.MaximumSize = New-Object Drawing.Size(640,0)
+$Intro.Margin = New-Object Windows.Forms.Padding(0,8,0,18)
+$MainLayout.Controls.Add($Intro)
 
-function New-ManagerButton {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 220)
-    $Button = New-Object System.Windows.Forms.Button
-    $Button.Text = $Text
-    $Button.Location = New-Object System.Drawing.Point($X, $Y)
-    $Button.Size = New-Object System.Drawing.Size($Width, 42)
-    $Button.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-    $Button.FlatStyle = "System"
-    $Form.Controls.Add($Button)
-    return $Button
-}
-
-$EditPrivateButton = New-ManagerButton -Text "Edit Private Resume" -X 28 -Y 92
-$EditPublicButton = New-ManagerButton -Text "Edit Public Resume" -X 270 -Y 92
-$OpenCurrentButton = New-ManagerButton -Text "Open Current Folder" -X 28 -Y 148
-$OpenHistoryButton = New-ManagerButton -Text "Open Version History" -X 270 -Y 148
+$ResumePanels = New-Object Windows.Forms.TableLayoutPanel
+$ResumePanels.AutoSize = $true; $ResumePanels.Dock = 'Fill'; $ResumePanels.ColumnCount = 2
+foreach($i in 1..2){[void]$ResumePanels.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent',50)))}
+$MainLayout.Controls.Add($ResumePanels)
+$PrivatePanel = New-Object Windows.Forms.GroupBox; $PrivatePanel.Text = 'Private Resume'; $PrivatePanel.Dock = 'Fill'; $PrivatePanel.AutoSize = $true
+$PublicPanel = New-Object Windows.Forms.GroupBox; $PublicPanel.Text = 'Public Resume'; $PublicPanel.Dock = 'Fill'; $PublicPanel.AutoSize = $true
+$ResumePanels.Controls.Add($PrivatePanel,0,0); $ResumePanels.Controls.Add($PublicPanel,1,0)
+$PrivateActions = New-Object Windows.Forms.FlowLayoutPanel; $PrivateActions.FlowDirection = 'TopDown'; $PrivateActions.Dock = 'Fill'; $PrivateActions.AutoSize = $true; $PrivateActions.Padding = New-Object Windows.Forms.Padding(8,12,8,8)
+$PublicActions = New-Object Windows.Forms.FlowLayoutPanel; $PublicActions.FlowDirection = 'TopDown'; $PublicActions.Dock = 'Fill'; $PublicActions.AutoSize = $true; $PublicActions.Padding = $PrivateActions.Padding
+$PrivatePanel.Controls.Add($PrivateActions); $PublicPanel.Controls.Add($PublicActions)
+$EditPrivateButton = New-UiButton 'Edit &Private Resume'; $EditPublicButton = New-UiButton 'Edit P&ublic Resume'
+$PreviewPrivateButton = New-UiButton 'Open Private PDF'; $PreviewPublicButton = New-UiButton 'Open Public PDF'
+$PrivateActions.Controls.AddRange(@($EditPrivateButton,$PreviewPrivateButton)); $PublicActions.Controls.AddRange(@($EditPublicButton,$PreviewPublicButton))
+$PdfPreviewDate = New-UiLabel 'Archived PDFs only - not unsaved Word edits.'; $PdfPreviewDate.MaximumSize = New-Object Drawing.Size(640,0); $MainLayout.Controls.Add($PdfPreviewDate)
+$Secondary = New-Object Windows.Forms.FlowLayoutPanel; $Secondary.AutoSize = $true; $Secondary.Dock = 'Fill'; $Secondary.Margin = New-Object Windows.Forms.Padding(0,12,0,12)
+$OpenCurrentButton = New-UiButton 'Open &Current Folder'; $OpenHistoryButton = New-UiButton 'Open &Version History'; $SettingsButton = New-UiButton '&Settings'
+$Secondary.Controls.AddRange(@($OpenCurrentButton,$OpenHistoryButton,$SettingsButton)); $MainLayout.Controls.Add($Secondary)
 
 $LatestCaption = New-Object System.Windows.Forms.Label
 $LatestCaption.Text = "Latest archived version"
 $LatestCaption.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $LatestCaption.AutoSize = $true
-$LatestCaption.Location = New-Object System.Drawing.Point(28, 214)
-$Form.Controls.Add($LatestCaption)
+$MainLayout.Controls.Add($LatestCaption)
 
 $LatestValue = New-Object System.Windows.Forms.Label
-$LatestValue.Text = Get-LatestArchive
+$LatestValue.Text = Format-ArchiveDate (Get-LatestArchive)
 $LatestValue.Font = New-Object System.Drawing.Font("Consolas", 10)
 $LatestValue.AutoSize = $true
-$LatestValue.Location = New-Object System.Drawing.Point(28, 236)
-$Form.Controls.Add($LatestValue)
+$MainLayout.Controls.Add($LatestValue)
 
 $StatusCaption = New-Object System.Windows.Forms.Label
 $StatusCaption.Text = "Status"
 $StatusCaption.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $StatusCaption.AutoSize = $true
-$StatusCaption.Location = New-Object System.Drawing.Point(270, 214)
-$Form.Controls.Add($StatusCaption)
+$MainLayout.Controls.Add($StatusCaption)
 
 $StatusValue = New-Object System.Windows.Forms.Label
 $StatusValue.Text = "Ready"
 $StatusValue.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-$StatusValue.AutoEllipsis = $true
-$StatusValue.Location = New-Object System.Drawing.Point(270, 236)
-$StatusValue.Size = New-Object System.Drawing.Size(220, 24)
-$Form.Controls.Add($StatusValue)
+$StatusValue.AutoSize = $true; $StatusValue.MaximumSize = New-Object Drawing.Size(640,0); $StatusValue.AccessibleName = 'Save status'
+$MainLayout.Controls.Add($StatusValue)
+$ProgressBar = New-Object Windows.Forms.ProgressBar; $ProgressBar.Dock = 'Fill'; $ProgressBar.Height = 8; $ProgressBar.Style = 'Marquee'; $ProgressBar.Visible = $false
+$MainLayout.Controls.Add($ProgressBar)
+$ReviewSummary = New-UiLabel 'Review the public PDF before sharing.'; $ReviewSummary.MaximumSize = New-Object Drawing.Size(640,0); $MainLayout.Controls.Add($ReviewSummary)
+$DetailsToggle = New-Object Windows.Forms.CheckBox; $DetailsToggle.Text = 'Show &details'; $DetailsToggle.AutoSize = $true; $MainLayout.Controls.Add($DetailsToggle)
+$DetailsPanel = New-Object Windows.Forms.FlowLayoutPanel; $DetailsPanel.AutoSize = $true; $DetailsPanel.Dock = 'Fill'; $DetailsPanel.FlowDirection = 'TopDown'; $DetailsPanel.Visible = $false
+$StatusDetail = New-UiLabel 'Ready'; $StatusDetail.MaximumSize = New-Object Drawing.Size(640,0); $DetailsPanel.Controls.Add($StatusDetail)
+$ReviewValue = New-UiLabel 'Open a public PDF to review its layout before sharing.'; $ReviewValue.MaximumSize = New-Object Drawing.Size(640,0); $DetailsPanel.Controls.Add($ReviewValue)
+$ErrorDetail = New-UiLabel ''; $ErrorDetail.MaximumSize = New-Object Drawing.Size(640,0); $DetailsPanel.Controls.Add($ErrorDetail); $MainLayout.Controls.Add($DetailsPanel)
+$DetailsToggle.Add_CheckedChanged({$DetailsPanel.Visible=$DetailsToggle.Checked})
+$ErrorPanel = New-Object Windows.Forms.FlowLayoutPanel; $ErrorPanel.AutoSize = $true; $ErrorPanel.FlowDirection = 'TopDown'; $ErrorPanel.Dock = 'Fill'; $ErrorPanel.Visible = $false
+$ErrorValue = New-UiLabel ''; $ErrorValue.MaximumSize = New-Object Drawing.Size(640,150)
+$ErrorPanel.Controls.Add($ErrorValue)
+$RecoveryActions = New-Object Windows.Forms.FlowLayoutPanel; $RecoveryActions.AutoSize = $true
+$RetryButton = New-UiButton '&Retry save'; $OpenRecoveryButton = New-UiButton 'Open recovery folder'; $CopyDiagnosticsButton = New-UiButton 'Copy redacted diagnostics'
+$RecoveryActions.Controls.AddRange(@($RetryButton,$OpenRecoveryButton,$CopyDiagnosticsButton)); $ErrorPanel.Controls.Add($RecoveryActions); $MainLayout.Controls.Add($ErrorPanel)
 
 $Hint = New-Object System.Windows.Forms.Label
 $Hint.Text = "Save normally in Word. The manager handles versioning automatically."
 $Hint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-$Hint.ForeColor = [System.Drawing.Color]::DimGray
+$Hint.ForeColor = [Drawing.SystemColors]::WindowText
 $Hint.AutoSize = $true
-$Hint.Location = New-Object System.Drawing.Point(28, 298)
-$Form.Controls.Add($Hint)
-
-$RetryButton = New-ManagerButton -Text 'Retry save' -X 270 -Y 266 -Width 110
-$RetryButton.Height = 26
+$Hint.MaximumSize = New-Object Drawing.Size(640,0); $MainLayout.Controls.Add($Hint)
 $RetryButton.Visible = $false
 
 function Set-Status {
     param([string]$Text, [switch]$Error)
-    $StatusValue.Text = $Text
-    $StatusValue.ForeColor = if ($Error) { [System.Drawing.Color]::Firebrick } else { [System.Drawing.Color]::Black }
+    $StatusDetail.Text = $Text
+    $StatusValue.Text = if($Text -match '^Editing'){'Editing in Word'}elseif($Text -match '^(Preparing|Exporting|Checking|Updating|Saving)'){'Saving version'}else{$Text}
+    $StatusValue.ForeColor = if ($Error) { [Drawing.SystemColors]::HotTrack } else { [Drawing.SystemColors]::WindowText }
+    $ProgressBar.Visible = $null -ne $script:ArchiveProcess
 }
 
 function Set-EditButtonsEnabled {
     param([bool]$Enabled)
     $EditPrivateButton.Enabled = $Enabled
     $EditPublicButton.Enabled = $Enabled
+    $SettingsButton.Enabled = $Enabled
+}
+
+function Show-ManagerError([string]$Detail) {
+    $script:LastErrorDetail = $Detail
+    $ErrorDetail.Text = $Detail
+    $ErrorValue.Text = if($Detail -match 'Private contact details|private-only|PublicContact|privacy validation|Configured private details'){'Privacy check failed. Do not share this output; review details to correct it.'}else{'The operation failed. Your source is retained. Retry or open recovery; the exact error is under Show details.'}
+    $ErrorPanel.Visible = $true
+    $RetryButton.Visible = $script:SessionActive -and $null -eq $script:ArchiveProcess
+    Set-Status 'Error' -Error
+}
+
+function Update-PublicReview {
+    $Latest = @(Get-ArchiveDirectories $UpdatesDir) | Select-Object -First 1
+    $PreviewPrivateButton.Enabled = $Latest -and (Test-Path -LiteralPath (Join-Path $Latest.FullName ([IO.Path]::ChangeExtension($PrivateName,'.pdf'))))
+    $PreviewPublicButton.Enabled = $Latest -and (Test-Path -LiteralPath (Join-Path $Latest.FullName ([IO.Path]::ChangeExtension($PublicName,'.pdf'))))
+    if(-not $Latest){$PdfPreviewDate.Text='No archived PDF yet. Save an edit to create the first version.';return}
+    $PdfPreviewDate.Text = 'PDF previews saved: ' + (Format-ArchiveDate $Latest.Name) + '. Not unsaved Word edits.'
+    try {
+        $Result = & $PythonExe $VariantScript --review $Latest.FullName --config $ConfigPath 2>&1
+        if($LASTEXITCODE -ne 0){throw ($Result -join "`n")}
+        $Review = ($Result -join "`n") | ConvertFrom-Json
+        $ReviewValue.Text = "Private PDF: $($Review.PrivatePages) page(s) | Public PDF: $($Review.PublicPages) page(s)`n$($Review.Checks)`n$($Review.Warnings -join '; ')"
+        $ReviewSummary.Text = "Private PDF: $($Review.PrivatePages) page(s) | Public PDF: $($Review.PublicPages) page(s). Review public output before sharing."
+        if($Review.PrivatePages -gt 1 -or $Review.PublicPages -gt 1){$ReviewSummary.Text += ' More than one page: check layout.'}
+        $ReviewSummary.ForeColor = [Drawing.SystemColors]::WindowText
+    }catch{$ReviewValue.Text = 'Latest output review unavailable: ' + $_.Exception.Message; $ReviewSummary.Text='Latest output is incomplete or failed review. Do not share it before checking details.'; $ReviewSummary.ForeColor=[Drawing.SystemColors]::HotTrack}
 }
 
 function Remove-WorkingDirectory {
@@ -221,6 +271,7 @@ function End-EditSession {
     Release-WordObjects
 
     $SavedWorkingPath = $script:WorkingPath
+    $script:RecoveryPath = $script:WorkingDir
     if (-not $PreserveWorkingCopy) {
         try { Remove-WorkingDirectory -Path $script:WorkingDir } catch {}
     }
@@ -235,14 +286,7 @@ function End-EditSession {
     Set-EditButtonsEnabled -Enabled $true
     Set-Status -Text $Message
 
-    if ($PreserveWorkingCopy) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "The edited working copy was preserved at:`n$SavedWorkingPath",
-            "Resume Manager",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Warning
-        ) | Out-Null
-    }
+    if ($PreserveWorkingCopy) { Show-ManagerError ($script:LastErrorDetail + "`nEdited copy preserved: $SavedWorkingPath") }
 }
 
 function Start-ArchiveProcess {
@@ -279,11 +323,15 @@ function Start-ArchiveProcess {
     $script:PendingChange = $false
     $script:ArchiveStdout = Join-Path $script:WorkingDir "workflow.stdout.txt"
     $script:ArchiveStderr = Join-Path $script:WorkingDir "workflow.stderr.txt"
+    $script:ArchiveProgress = Join-Path $script:WorkingDir 'progress.json'
+    $script:ArchiveStarted = [datetime]::UtcNow
+    $script:StallShown = $false
+    $ErrorPanel.Visible = $false
 
     $EscapedWorkflow = $WorkflowPath.Replace("'", "''")
     $EscapedSource = $SnapshotPath.Replace("'", "''")
     $EscapedConfig = $ConfigPath.Replace("'", "''")
-    $Command = "try { & '$EscapedWorkflow' -SourcePath '$EscapedSource' -ConfigPath '$EscapedConfig'; exit 0 } catch { [Console]::Error.WriteLine(`$_); exit 1 }"
+    $Command = "try { & '$EscapedWorkflow' -SourcePath '$EscapedSource' -ConfigPath '$EscapedConfig' -ProgressPath '$($script:ArchiveProgress.Replace("'","''"))'; exit 0 } catch { [Console]::Error.WriteLine(`$_); exit 1 }"
     $Encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
 
     $script:ArchiveProcess = Start-Process -FilePath $PowerShellExe `
@@ -294,30 +342,39 @@ function Start-ArchiveProcess {
         -PassThru
     # Keep the process handle so Windows PowerShell can retrieve ExitCode after Refresh.
     $null = $script:ArchiveProcess.Handle
+    $ProgressBar.Visible = $true
 }
 
 function Complete-ArchiveProcess {
     $script:ArchiveProcess.Refresh()
-    if (-not $script:ArchiveProcess.HasExited) { return }
+    if (-not $script:ArchiveProcess.HasExited) {
+        $Phase = 'Saving new version'
+        if(Test-Path -LiteralPath $script:ArchiveProgress){try{$Phase=(Get-Content -LiteralPath $script:ArchiveProgress -Raw | ConvertFrom-Json).Phase}catch{}}
+        $Queued = if($script:PendingChange){' - another save queued'}else{''}
+        $Elapsed = [int]([datetime]::UtcNow-$script:ArchiveStarted).TotalSeconds
+        Set-Status "Saving version - $Phase ($Elapsed s)$Queued"
+        if($Elapsed -gt 120 -and -not $script:StallShown){
+            $script:StallShown=$true; $script:RecoveryPath=$script:WorkingDir
+            $ErrorValue.Text = 'Export is taking longer than expected. Check Word for a dialog. The manager is still monitoring; recovery files are retained. It will not terminate Word automatically.'
+            $script:LastErrorDetail=$ErrorValue.Text; $ErrorDetail.Text=$ErrorValue.Text
+            $ErrorPanel.Visible=$true; $RetryButton.Visible=$false
+        }
+        return
+    }
     $script:ArchiveProcess.WaitForExit()
     $ExitCode = $script:ArchiveProcess.ExitCode
     $Output = if (Test-Path -LiteralPath $script:ArchiveStdout) { Get-Content -LiteralPath $script:ArchiveStdout -Raw } else { "" }
     $Errors = if (Test-Path -LiteralPath $script:ArchiveStderr) { Get-Content -LiteralPath $script:ArchiveStderr -Raw } else { "" }
     $script:ArchiveProcess.Dispose()
     $script:ArchiveProcess = $null
+    $ProgressBar.Visible = $false
 
     if ($ExitCode -ne 0) {
         $Detail = ($Errors + "`n" + $Output).Trim()
         if ([string]::IsNullOrWhiteSpace($Detail)) { $Detail = "The resume workflow exited with code $ExitCode." }
-        Set-Status -Text "Error" -Error
         $script:LastFailedHash = $script:HashBeingArchived
-        $RetryButton.Visible = $true
-        [System.Windows.Forms.MessageBox]::Show(
-            $Detail,
-            "Resume Manager Error",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
+        $script:RecoveryPath = $script:WorkingDir
+        Show-ManagerError $Detail
         if ($script:WordClosed) { End-EditSession -PreserveWorkingCopy -Message "Error" }
         return
     }
@@ -325,8 +382,12 @@ function Complete-ArchiveProcess {
     $script:LastArchivedHash = $script:HashBeingArchived
     $script:LastFailedHash = $null
     $RetryButton.Visible = $false
-    $LatestValue.Text = Get-LatestArchive
+    $ErrorPanel.Visible = $false
+    $LatestValue.Text = Format-ArchiveDate (Get-LatestArchive)
+    Update-PublicReview
     Set-Status -Text "Version saved"
+    $WebsiteOutcome = @($Output -split "`n" | Where-Object {$_ -match 'Website copy|Updated website public resume'}) | Select-Object -Last 1
+    if($WebsiteOutcome){$ReviewValue.Text += "`n" + $(if($WebsiteOutcome -match '^Updated website'){'Website copy updated.'}else{$WebsiteOutcome.Trim()})}
 
     try {
         $CurrentHash = Get-ResumeHash -Path $script:WorkingPath
@@ -360,6 +421,8 @@ function Start-EditSession {
     Copy-Item -LiteralPath $Source -Destination $script:WorkingPath
 
     try {
+        $script:SessionKind = $Kind.ToLower()
+        $ErrorPanel.Visible = $false
         $script:LastArchivedHash = Get-ResumeHash -Path $script:WorkingPath
         $Item = Get-Item -LiteralPath $script:WorkingPath
         $script:LastSignature = "$($Item.Length)|$($Item.LastWriteTimeUtc.Ticks)"
@@ -377,7 +440,9 @@ function Start-EditSession {
 
         $script:Word = New-Object -ComObject Word.Application
         $script:Word.Visible = $true
-        $script:WordDocument = $script:Word.Documents.Open($script:WorkingPath)
+        $Check = & $PythonExe $VariantScript --check-source $script:WorkingPath --config $ConfigPath 2>&1
+        if($LASTEXITCODE -ne 0){throw ($Check -join "`n")}
+        $script:WordDocument = Open-ResumeWordDocument $script:Word $script:WorkingPath
 
         $script:SessionActive = $true
         Set-EditButtonsEnabled -Enabled $false
@@ -389,20 +454,33 @@ function Start-EditSession {
         try { Remove-WorkingDirectory -Path $script:WorkingDir } catch {}
         $script:WorkingPath = $null
         $script:WorkingDir = $null
-        Set-Status -Text "Error" -Error
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Resume Manager Error") | Out-Null
+        Show-ManagerError $_.Exception.Message
     }
 }
 
 $EditPrivateButton.Add_Click({ Start-EditSession -Kind "Private" })
 $EditPublicButton.Add_Click({ Start-EditSession -Kind "Public" })
 $OpenCurrentButton.Add_Click({ Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $CurrentDir) })
-$OpenHistoryButton.Add_Click({ Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $UpdatesDir) })
+$OpenHistoryButton.Add_Click({ Show-HistoryDialog $Form })
+$SettingsButton.Add_Click({
+    if($script:SessionActive -or $null -ne $script:ArchiveProcess){return}
+    if(Show-SettingsDialog $ConfigPath $Form){
+        . (Join-Path $PSScriptRoot 'resume_settings.ps1') -ConfigPath $ConfigPath
+        foreach($Name in @('Root','CurrentDir','UpdatesDir','PrivateName','PublicName','CurrentPrivate','CurrentPublic','CurrentPrivateName','CurrentPublicName','PythonExe','VariantScript','Settings','WebsitePublic')){Set-Variable -Name $Name -Scope Script -Value (Get-Variable -Name $Name -ValueOnly)}
+        $ErrorPanel.Visible=$false; $ErrorDetail.Text=''; $script:LastErrorDetail=''
+        $LatestValue.Text = Format-ArchiveDate (Get-LatestArchive); Update-PublicReview; Set-Status 'Ready'
+    }
+})
+$PreviewPrivateButton.Add_Click({try{$Latest=@(Get-ArchiveDirectories $UpdatesDir)|Select-Object -First 1; if(-not $Latest){throw 'No archived PDFs yet.'}; Open-LocalFile (Join-Path $Latest.FullName ([IO.Path]::ChangeExtension($PrivateName,'.pdf')))}catch{Show-ManagerError $_.Exception.Message}})
+$PreviewPublicButton.Add_Click({try{$Latest=@(Get-ArchiveDirectories $UpdatesDir)|Select-Object -First 1; if(-not $Latest){throw 'No archived PDFs yet.'}; Open-LocalFile (Join-Path $Latest.FullName ([IO.Path]::ChangeExtension($PublicName,'.pdf')))}catch{Show-ManagerError $_.Exception.Message}})
+$OpenRecoveryButton.Add_Click({if(Test-Path -LiteralPath $script:RecoveryPath){Start-Process explorer.exe -ArgumentList ('"{0}"' -f $script:RecoveryPath)}})
+$CopyDiagnosticsButton.Add_Click({$Text = Get-RedactedDiagnostics $script:LastErrorDetail $Settings; if ($Text) {[Windows.Forms.Clipboard]::SetText($Text)}})
 $RetryButton.Add_Click({
     $script:LastFailedHash = $null
     $script:PendingChange = $true
     $script:LastFileEvent = [datetime]::UtcNow.AddSeconds(-3)
     $RetryButton.Visible = $false
+    $ErrorPanel.Visible = $false
 })
 
 $Timer = New-Object System.Windows.Forms.Timer
@@ -449,19 +527,38 @@ $Timer.Add_Tick({
             $script:LastFileEvent = [datetime]::UtcNow
         }
     }
-    catch { return }
+    catch {
+        $script:PendingChange = $false
+        Show-ManagerError $_.Exception.Message
+        if($script:WordClosed){End-EditSession -PreserveWorkingCopy -Message 'Error'}
+        return
+    }
 
-    if (-not $script:PendingChange) { return }
+    if (-not $script:PendingChange) {
+        if(-not $script:WordClosed -and -not $ErrorPanel.Visible){try{if(-not $script:WordDocument.Saved){Set-Status "Editing $script:SessionKind - unsaved changes in Word"}}catch{}}
+        return
+    }
     if (([datetime]::UtcNow - $script:LastFileEvent).TotalSeconds -lt 1.5) { return }
 
     try {
         Start-ArchiveProcess
     }
     catch {
-        Set-Status -Text "Waiting for Word"
+        $Message = $_.Exception.Message
+        $Inner = $_.Exception
+        while($Inner.InnerException){$Inner=$Inner.InnerException}
+        $Sharing = $Inner -is [IO.IOException] -and (($Inner.HResult -band 65535) -in @(32,33))
+        $RacingPackage = $Message -match 'BadZipFile|not a zip file' -and ([datetime]::UtcNow-$script:LastFileEvent).TotalSeconds -lt 10
+        if($Sharing -or $RacingPackage -or $Message -eq 'Word is still saving; waiting for a stable saved package.') { Set-Status 'Waiting for Word' }
+        else {
+            $script:PendingChange=$false; $script:RecoveryPath=$script:WorkingDir
+            Show-ManagerError $Message
+            if($script:WordClosed){End-EditSession -PreserveWorkingCopy -Message 'Error'}
+        }
     }
 })
 $Timer.Start()
+Update-PublicReview
 
 $Form.Add_FormClosing({
     param($Sender, $EventArgs)
@@ -474,6 +571,12 @@ $Form.Add_FormClosing({
             [System.Windows.Forms.MessageBoxIcon]::Information
         ) | Out-Null
     }
+})
+$Form.Add_KeyDown({
+    param($Sender,$Event)
+    if($Event.Control -and $Event.KeyCode -eq 'P' -and $EditPrivateButton.Enabled){$EditPrivateButton.PerformClick();$Event.SuppressKeyPress=$true}
+    elseif($Event.Control -and $Event.KeyCode -eq 'U' -and $EditPublicButton.Enabled){$EditPublicButton.PerformClick();$Event.SuppressKeyPress=$true}
+    elseif($Event.Control -and $Event.KeyCode -eq 'H'){$OpenHistoryButton.PerformClick();$Event.SuppressKeyPress=$true}
 })
 
 if ($LoadOnly) { return }

@@ -4,11 +4,22 @@ param(
     [string]$SourcePath,
     [string]$WebsitePublicPath,
     [string]$ConfigPath = $env:RESUME_MANAGER_CONFIG,
+    [string]$ProgressPath,
     [switch]$SkipProjectRewrite,
     [switch]$NoPdf
 )
 
 $ErrorActionPreference = "Stop"
+
+function Write-Phase([string]$Phase) {
+    if (-not $ProgressPath) { return }
+    $Target = [IO.Path]::GetFullPath($ProgressPath)
+    $Code = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\') + '\'
+    if ($Target.StartsWith($Code,[StringComparison]::OrdinalIgnoreCase)) { throw 'Progress files must be outside the repository.' }
+    $Temporary = $Target + '.tmp'
+    [IO.File]::WriteAllText($Temporary, (@{Phase=$Phase;Time=[datetime]::UtcNow.ToString('o')} | ConvertTo-Json))
+    if (Test-Path -LiteralPath $Target) { [IO.File]::Replace($Temporary,$Target,[NullString]::Value) } else { [IO.File]::Move($Temporary,$Target) }
+}
 
 . (Join-Path $PSScriptRoot 'resume_settings.ps1') -ConfigPath $ConfigPath
 if (-not $PSBoundParameters.ContainsKey('WebsitePublicPath')) { $WebsitePublicPath = $WebsitePublic }
@@ -108,6 +119,7 @@ $FailedDir = $null
 $Word = $null
 
 try {
+    Write-Phase 'Preparing variants'
     New-Item -ItemType Directory -Path $StageDir | Out-Null
     Copy-Item -LiteralPath $SourcePath -Destination (Join-Path $StageDir $PrivateName)
     Copy-Item -LiteralPath (Join-Path $StageDir $PrivateName) -Destination (Join-Path $StageDir $PublicName)
@@ -122,6 +134,7 @@ try {
     }
 
     if (-not $NoPdf) {
+        Write-Phase 'Exporting PDFs'
         $Word = New-Object -ComObject Word.Application
         $Word.Visible = $false
         $Word.DisplayAlerts = 0
@@ -131,7 +144,7 @@ try {
             try {
                 $DocxPath = Join-Path $StageDir $DocxName
                 $PdfPath = [System.IO.Path]::ChangeExtension($DocxPath, ".pdf")
-                $Doc = $Word.Documents.Open($DocxPath, $false, $true)
+                $Doc = Open-ResumeWordDocument $Word $DocxPath $true
                 $Doc.ExportAsFixedFormat($PdfPath, 17)
             }
             finally {
@@ -145,6 +158,7 @@ try {
 
     $ExpectedFiles = @($PrivateName, $PublicName)
     if (-not $NoPdf) {
+        Write-Phase 'Checking privacy'
         $ExpectedFiles += @(
             [System.IO.Path]::ChangeExtension($PrivateName, ".pdf"),
             [System.IO.Path]::ChangeExtension($PublicName, ".pdf")
@@ -164,6 +178,7 @@ try {
     }
 
     Move-Item -LiteralPath $StageDir -Destination $NewDir
+    Write-Phase 'Updating Current'
 
     $PublishFiles = @(
         @{Source=(Join-Path $NewDir $PrivateName); Destination=$CurrentPrivate},
@@ -175,6 +190,7 @@ try {
         $PublishFiles += @{Source=(Join-Path $NewDir $PublicName); Destination=$WebsitePublicPath}
     }
     Publish-ResumeFiles -Files $PublishFiles
+    Write-Phase 'Version saved'
 
     Write-Output "Created update folder: $NewDir"
     Write-Output "Updated current private resume: $CurrentPrivate"
@@ -182,6 +198,8 @@ try {
     if ($WebsiteResumeDir -and (Test-Path -LiteralPath $WebsiteResumeDir -PathType Container)) {
         Write-Output "Updated website public resume: $WebsitePublicPath"
     }
+    elseif ($WebsitePublicPath) { Write-Output 'Website copy skipped: destination folder does not exist.' }
+    else { Write-Output 'Website copy disabled.' }
 }
 catch {
     $OriginalFailure = $_.Exception.Message

@@ -1,6 +1,20 @@
 param([string]$ConfigPath = $env:RESUME_MANAGER_CONFIG)
 
 $ErrorActionPreference = 'Stop'
+
+function Open-ResumeWordDocument($Application,[string]$Path,[bool]$ReadOnly = $false) {
+    $PreviousSecurity = $Application.AutomationSecurity
+    $PreviousLinks = $Application.Options.UpdateLinksAtOpen
+    try {
+        $Application.AutomationSecurity = 3
+        $Application.Options.UpdateLinksAtOpen = $false
+        return $Application.Documents.Open($Path,$false,$ReadOnly,$false)
+    }
+    finally {
+        $Application.AutomationSecurity = $PreviousSecurity
+        $Application.Options.UpdateLinksAtOpen = $PreviousLinks
+    }
+}
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $env:LOCALAPPDATA 'ResumeManager\settings.local.json'
 }
@@ -8,7 +22,7 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Local settings not found: $ConfigPath. Follow README.md to create settings outside the program repository."
 }
 $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
-$Settings = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+$Settings = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $CodeRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\') + '\'
 if ($ConfigPath.StartsWith($CodeRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Personal settings must be stored outside the program repository.'
@@ -16,7 +30,7 @@ if ($ConfigPath.StartsWith($CodeRoot, [StringComparison]::OrdinalIgnoreCase)) {
 foreach ($Key in @('DataRoot','PrivateContact','PublicContact','ContactAnchor')) {
     if ([string]::IsNullOrWhiteSpace($Settings.$Key)) { throw "Missing local setting: $Key" }
 }
-if (-not $Settings.PrivateOnly -or $Settings.PrivateOnly -is [string]) { throw 'PrivateOnly must be a nonempty array of private contact values.' }
+if (-not $Settings.PrivateOnly -or $Settings.PrivateOnly -isnot [array]) { throw 'PrivateOnly must be a nonempty array of private contact values.' }
 $Root = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Settings.DataRoot))
 if (($Root.TrimEnd('\') + '\').StartsWith($CodeRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Resume data must be stored outside the program repository.'
@@ -37,5 +51,5 @@ $WebsitePublic = [Environment]::ExpandEnvironmentVariables([string]$Settings.Web
 if ($WebsitePublic -and ([IO.Path]::GetFullPath($WebsitePublic)).StartsWith($CodeRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Website document destination must be outside the program repository.'
 }
-$PythonExe = if ($Settings.PythonExe) { [Environment]::ExpandEnvironmentVariables([string]$Settings.PythonExe) } else { (Get-Command python.exe -ErrorAction Stop).Source }
+$PythonExe = if ($Settings.PythonExe) { [Environment]::ExpandEnvironmentVariables([string]$Settings.PythonExe) } else { 'python.exe' }
 $VariantScript = Join-Path $PSScriptRoot 'update_resume_projects.py'

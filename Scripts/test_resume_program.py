@@ -36,6 +36,39 @@ with tempfile.TemporaryDirectory(prefix="resume-program-test-") as temp:
     assert program.has_private_details("personal%40example.com")
     assert program.has_private_details("000-0000-0000")
     assert not program.has_private_details(program.PUBLIC_CONTACT)
+    previous_private = program.PRIVATE_ONLY
+    program.PRIVATE_ONLY = previous_private + ['Stra'+chr(0xDF)+'e']
+    assert program.has_private_details('Stra'+chr(0xDF)+'e') and program.has_private_details('STRASSE')
+    program.PRIVATE_ONLY = previous_private
+    # Retained field styles and unrelated relationships survive linked contact replacement.
+    linked = b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:r><w:t>Example Name</w:t></w:r></w:p><w:p><w:hyperlink r:id="rId1"><w:r><w:rPr><w:b/></w:rPr><w:t>public@example.com</w:t></w:r></w:hyperlink><w:r><w:t> | </w:t></w:r><w:hyperlink r:id="rId2"><w:r><w:t>personal@example.com</w:t></w:r></w:hyperlink><w:r><w:t> | 00000000000 | </w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>Example City</w:t></w:r></w:p><w:p><w:hyperlink r:id="rId3"><w:r><w:t>Other link</w:t></w:r></w:hyperlink></w:p></w:body></w:document>'
+    relationships = b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="mailto:public@example.com" TargetMode="External"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="mailto:personal@example.com" TargetMode="External"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org" TargetMode="External"/></Relationships>'
+    for name, contact in ((program.PRIVATE_NAME,program.PRIVATE_CONTACT),(program.PUBLIC_NAME,program.PUBLIC_CONTACT)):
+        with ZipFile(directory/name,'w') as package:
+            package.writestr('word/document.xml',linked); package.writestr(program.RELS_PART,relationships)
+            package.writestr('word/media/image.bin',b'synthetic-payload')
+        program.set_contact(directory/name,contact)
+    program.validate_variants(directory)
+    with ZipFile(directory/program.PUBLIC_NAME) as package:
+        root = program.parse_xml(package.read('word/document.xml'))
+        assert len(list(program.contact_paragraph(root).iter(program.W+'b'))) == 1
+        assert len(list(program.contact_paragraph(root).iter(program.W+'i'))) == 1
+        rels = program.parse_xml(package.read(program.RELS_PART))
+        assert not any('personal@example.com' in e.get('Target','') for e in rels)
+        assert any(e.get('Id')=='rId3' and e.get('Target')=='https://example.org' for e in rels)
+    # A shared private contact relationship must fail, not silently change unrelated content.
+    shared = linked.replace(b'r:id="rId3"',b'r:id="rId2"')
+    for name,contact in ((program.PRIVATE_NAME,program.PRIVATE_CONTACT),(program.PUBLIC_NAME,program.PUBLIC_CONTACT)):
+        with ZipFile(directory/name,'w') as package:
+            package.writestr('word/document.xml',shared); package.writestr(program.RELS_PART,relationships)
+        program.set_contact(directory/name,contact)
+    try: program.validate_variants(directory)
+    except RuntimeError as error: assert 'Private contact details' in str(error)
+    else: raise AssertionError('Shared private target escaped privacy validation')
+    # Restore plain packages for subsequent hidden-text checks.
+    for name,contact in ((program.PRIVATE_NAME,program.PRIVATE_CONTACT),(program.PUBLIC_NAME,program.PUBLIC_CONTACT)):
+        with ZipFile(directory/name,'w') as package: package.writestr('word/document.xml',xml)
+        program.set_contact(directory/name,contact)
     for name in (program.PRIVATE_NAME, program.PUBLIC_NAME):
         with ZipFile(directory / name, "a") as package:
             package.writestr("word/comments.xml", b'<comments><t>personal@</t><t>example.com</t></comments>')
@@ -53,5 +86,41 @@ with tempfile.TemporaryDirectory(prefix="resume-program-test-") as temp:
         pass
     else:
         raise AssertionError("Leaking contact settings were not rejected")
+    unsupported = directory/'unsupported.docx'
+    with ZipFile(unsupported,'w') as package:
+        package.writestr('word/document.xml',xml.replace(b'<w:t>public@',b'<w:tab/><w:t>public@'))
+    unchanged = unsupported.read_bytes()
+    try: program.set_contact(unsupported,program.PUBLIC_CONTACT)
+    except ValueError as error: assert 'Non-text contact' in str(error)
+    else: raise AssertionError('Unsupported contact run was silently flattened')
+    assert unchanged == unsupported.read_bytes()
+    inspected = directory/'inspect.docx'
+    with ZipFile(inspected,'w') as package:
+        package.writestr('[Content_Types].xml',b'<Types/>');package.writestr('word/document.xml',xml)
+    source_bytes = inspected.read_bytes()
+    assert program.inspect_contact(inspected)['Fields'] == ['public@example.com','Example City']
+    assert source_bytes == inspected.read_bytes()
+    assert program.inspect_contact(inspected,'public@example.com')['ContactLine'] == 'public@example.com | Example City'
+    with ZipFile(inspected,'w') as package:
+        package.writestr('[Content_Types].xml',b'<Types/>');package.writestr('word/document.xml',xml.replace(b'public@example.com | Example City',b'public@example.com'))
+    assert program.inspect_contact(inspected)['Fields'] == ['public@example.com']
+    with ZipFile(inspected,'w') as package:
+        package.writestr('[Content_Types].xml',b'<Types/>')
+        package.writestr('word/document.xml',xml.replace(b'</w:body>',b'<w:p><w:r><w:t>other@example.com | Other City</w:t></w:r></w:p></w:body>'))
+    try: program.inspect_contact(inspected)
+    except ValueError as error: assert 'one contact line' in str(error)
+    else: raise AssertionError('Ambiguous contact detection was accepted')
+    assert program.inspect_contact(inspected,'public@example.com')['Fields'][0] == 'public@example.com'
+    with ZipFile(inspected,'w') as package:
+        package.writestr('[Content_Types].xml',b'<Types/>');package.writestr('word/document.xml',xml.replace(b'<w:t>public@',b'<w:tab/><w:t>public@'))
+    try: program.inspect_contact(inspected)
+    except ValueError as error: assert 'Non-text contact' in str(error)
+    else: raise AssertionError('Unsupported inspection markup was accepted')
+    disguised = directory/'renamed.docx'
+    with ZipFile(disguised,'w') as package:
+        package.writestr('word/document.xml',xml); package.writestr('word/vbaProject.bin',b'synthetic-macro-marker')
+    try: program.check_source(disguised)
+    except ValueError as error: assert 'Macro-enabled' in str(error)
+    else: raise AssertionError('Disguised macro package was accepted')
 
-print("PASS: synthetic package preservation, fingerprints, and private contact rejection")
+print("PASS: synthetic preservation, linked contact styles, shared-link privacy, fingerprints, and macro rejection")

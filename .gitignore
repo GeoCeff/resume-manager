@@ -3,6 +3,7 @@
 !.gitignore
 !.gitattributes
 !README.md
+!LICENSE
 !Resume Manager.cmd
 !requirements.txt
 !settings.example.json
@@ -14,6 +15,8 @@ Scripts/*
 !Scripts/update_resume_projects.py
 !Scripts/check_repository.ps1
 !Scripts/test_resume_program.py
+!Scripts/manager_dialogs.ps1
+!Scripts/package_program.ps1
 !.githooks/
 .githooks/*
 !.githooks/pre-commit
