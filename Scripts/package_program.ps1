@@ -12,7 +12,9 @@ $Files = @(& (Join-Path $PSScriptRoot 'check_repository.ps1') -ListFiles)
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [void][IO.Directory]::CreateDirectory($OutputDirectory)
-$Target = Join-Path $OutputDirectory ('resume-manager-source-' + (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.zip')
+$Version = [regex]::Match((Get-Content -LiteralPath (Join-Path $PSScriptRoot 'manager_dialogs.ps1') -Raw), "ProgramVersion = '([^']+)'").Groups[1].Value
+if(-not $Version){throw 'Program version is missing.'}
+$Target = Join-Path $OutputDirectory ('resume-manager-' + $Version + '-source-' + (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.zip')
 $Stream = [IO.File]::Open($Target,'CreateNew','Write','None')
 $Archive = New-Object IO.Compression.ZipArchive($Stream,[IO.Compression.ZipArchiveMode]::Create)
 try{foreach($Name in $Files){if(-not (Test-Path -LiteralPath $Name -PathType Leaf)){throw "Missing allowlisted file: $Name"}; [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Archive,(Join-Path $Root $Name),$Name)}}finally{$Archive.Dispose();$Stream.Dispose()}

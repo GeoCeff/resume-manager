@@ -6,6 +6,7 @@ $Allowed = @('.gitignore','.gitattributes','README.md','Resume Manager.cmd','req
     'Scripts/update_resume_projects.py','Scripts/check_repository.ps1','Scripts/test_resume_program.py',
     '.githooks/pre-commit','.githooks/pre-push')
 $Allowed += @('Scripts/manager_dialogs.ps1','Scripts/package_program.ps1','LICENSE')
+$Allowed += 'Scripts/test_manager_features.ps1'
 if($ListFiles){$Allowed;return}
 function Check-Content([string]$Name,[string]$Content) {
     if ($Allowed -cnotcontains $Name) { throw "Blocked non-program file: $Name" }

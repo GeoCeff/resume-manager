@@ -15,6 +15,7 @@ Scripts/*
 !Scripts/update_resume_projects.py
 !Scripts/check_repository.ps1
 !Scripts/test_resume_program.py
+!Scripts/test_manager_features.ps1
 !Scripts/manager_dialogs.ps1
 !Scripts/package_program.ps1
 !.githooks/

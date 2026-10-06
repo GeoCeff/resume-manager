@@ -3,6 +3,15 @@ param([switch]$SelfTest, [switch]$LoadOnly, [string]$ConfigPath = $env:RESUME_MA
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot 'manager_dialogs.ps1')
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) { $ConfigPath = Join-Path $env:LOCALAPPDATA 'ResumeManager\settings.local.json' }
+$script:RegistryPath = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($ConfigPath))) 'profiles.local.json'
+$script:ProfileEntries = @()
+if(Test-Path -LiteralPath $script:RegistryPath){
+    try{
+        $Registry=Get-Content -LiteralPath $script:RegistryPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $script:ProfileEntries=@($Registry.Entries)
+        if(-not $PSBoundParameters.ContainsKey('ConfigPath') -and -not $env:RESUME_MANAGER_CONFIG -and $Registry.ActivePath){$ConfigPath=[string]$Registry.ActivePath}
+    }catch{[void][Windows.Forms.MessageBox]::Show('Profile list could not be read. Default settings will be used; the list was not reset.','Resume Manager')}
+}
 $CreatedNew = $false
 $Mutex = New-Object System.Threading.Mutex($true, 'ResumeManager.Application', [ref]$CreatedNew)
 if (-not $CreatedNew) {
@@ -14,8 +23,13 @@ while ($true) {
     $StartupIssue = Get-StartupIssue $ConfigPath
     if($StartupIssue.Kind -eq 'Ready'){break}
     if($SelfTest -or $LoadOnly){$Mutex.ReleaseMutex();$Mutex.Dispose();throw ($StartupIssue.Message + "`n" + $StartupIssue.Details)}
-    $Choice = if($StartupIssue.Kind -eq 'Setup'){'Edit settings'}else{Show-StartupRecovery $StartupIssue}
+    $Choice = Show-StartupRecovery $StartupIssue
     if($Choice -eq 'Retry'){continue}
+    if($Choice -eq 'Locate existing settings'){
+        $Picker=New-Object Windows.Forms.OpenFileDialog; $Picker.Filter='Local settings (*.json)|*.json'; $Picker.Title='Locate saved Resume Manager settings'
+        try{if($Picker.ShowDialog() -eq 'OK'){$ConfigPath=$Picker.FileName}}finally{$Picker.Dispose()}
+        continue
+    }
     if($Choice -eq 'Cancel' -or -not (Show-SettingsDialog $ConfigPath $null)){$Mutex.ReleaseMutex();$Mutex.Dispose();exit 0}
 }
 . (Join-Path $PSScriptRoot 'resume_settings.ps1') -ConfigPath $ConfigPath
@@ -23,6 +37,8 @@ $PythonExe = $StartupIssue.Python
 $WorkflowPath = Join-Path $PSScriptRoot "resume_update_workflow.ps1"
 $PowerShellExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
 $SessionRoot = Join-Path $env:TEMP 'ResumeManagerSessions'
+if(-not @($script:ProfileEntries | Where-Object {$_.SettingsPath -eq $ConfigPath}).Count){$script:ProfileEntries+= [pscustomobject]@{Name='General';SettingsPath=$ConfigPath}}
+Assert-ProfileRoot $Root $ConfigPath
 
 function Get-ResumeHash {
     param([Parameter(Mandatory)][string]$Path)
@@ -99,11 +115,14 @@ $script:ArchiveStarted = [datetime]::MinValue
 $script:ArchiveProgress = $null
 $script:StallShown = $false
 $script:Restoring = $false
+$script:OperationBusy = $false
+$script:WordHasUnsaved = $false
+$script:LastSavedAt = ''
 
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = "Resume Manager"
 $Form.StartPosition = "CenterScreen"
-$Form.ClientSize = New-Object System.Drawing.Size(720, 540)
+$Form.ClientSize = New-Object System.Drawing.Size(760, 650)
 $Form.MinimumSize = New-Object System.Drawing.Size(680,560)
 $Form.Font = New-Object Drawing.Font('Segoe UI',10)
 $Form.AutoScaleMode = 'Font'
@@ -128,6 +147,7 @@ $Intro.AutoSize = $true
 $Intro.MaximumSize = New-Object Drawing.Size(640,0)
 $Intro.Margin = New-Object Windows.Forms.Padding(0,8,0,18)
 $MainLayout.Controls.Add($Intro)
+$ProfileCaption=New-UiLabel ''; $ProfileCaption.AccessibleName='Active resume profile'; $MainLayout.Controls.Add($ProfileCaption)
 
 $ResumePanels = New-Object Windows.Forms.TableLayoutPanel
 $ResumePanels.AutoSize = $true; $ResumePanels.Dock = 'Fill'; $ResumePanels.ColumnCount = 2
@@ -145,7 +165,8 @@ $PrivateActions.Controls.AddRange(@($EditPrivateButton,$PreviewPrivateButton)); 
 $PdfPreviewDate = New-UiLabel 'Archived PDFs only - not unsaved Word edits.'; $PdfPreviewDate.MaximumSize = New-Object Drawing.Size(640,0); $MainLayout.Controls.Add($PdfPreviewDate)
 $Secondary = New-Object Windows.Forms.FlowLayoutPanel; $Secondary.AutoSize = $true; $Secondary.Dock = 'Fill'; $Secondary.Margin = New-Object Windows.Forms.Padding(0,12,0,12)
 $OpenCurrentButton = New-UiButton 'Open &Current Folder'; $OpenHistoryButton = New-UiButton 'Open &Version History'; $SettingsButton = New-UiButton '&Settings'
-$Secondary.Controls.AddRange(@($OpenCurrentButton,$OpenHistoryButton,$SettingsButton)); $MainLayout.Controls.Add($Secondary)
+$ExportButton=New-UiButton '&Export Resume'; $RecoveryButton=New-UiButton 'Recover Saved Copy'; $ProfilesButton=New-UiButton 'Profiles...'; $AboutButton=New-UiButton 'About / Help'
+$Secondary.Controls.AddRange(@($OpenCurrentButton,$OpenHistoryButton,$ExportButton,$SettingsButton,$RecoveryButton,$ProfilesButton,$AboutButton)); $MainLayout.Controls.Add($Secondary)
 
 $LatestCaption = New-Object System.Windows.Forms.Label
 $LatestCaption.Text = "Latest archived version"
@@ -170,6 +191,7 @@ $StatusValue.Text = "Ready"
 $StatusValue.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 $StatusValue.AutoSize = $true; $StatusValue.MaximumSize = New-Object Drawing.Size(640,0); $StatusValue.AccessibleName = 'Save status'
 $MainLayout.Controls.Add($StatusValue)
+$SaveInfo=New-UiLabel ''; $SaveInfo.AccessibleName='Last successful snapshot and queued save'; $SaveInfo.MaximumSize=New-Object Drawing.Size(680,0); $MainLayout.Controls.Add($SaveInfo)
 $ProgressBar = New-Object Windows.Forms.ProgressBar; $ProgressBar.Dock = 'Fill'; $ProgressBar.Height = 8; $ProgressBar.Style = 'Marquee'; $ProgressBar.Visible = $false
 $MainLayout.Controls.Add($ProgressBar)
 $ReviewSummary = New-UiLabel 'Review the public PDF before sharing.'; $ReviewSummary.MaximumSize = New-Object Drawing.Size(640,0); $MainLayout.Controls.Add($ReviewSummary)
@@ -197,7 +219,13 @@ $RetryButton.Visible = $false
 function Set-Status {
     param([string]$Text, [switch]$Error)
     $StatusDetail.Text = $Text
-    $StatusValue.Text = if($Text -match '^Editing'){'Editing in Word'}elseif($Text -match '^(Preparing|Exporting|Checking|Updating|Saving)'){'Saving version'}else{$Text}
+    $StatusValue.Text = if($Error -or $ErrorPanel.Visible){'Save failed; working copy retained'}
+        elseif($script:WordHasUnsaved){'Unsaved changes in Word'}
+        elseif($Text -match '^(Preparing|Exporting|Checking|Updating|Saving)'){'Word saved; generating versions'}
+        else{$Text}
+    $SaveInfo.Text = 'Last successful snapshot: '+$(if($script:LastSavedAt){$script:LastSavedAt}else{Format-ArchiveDate (Get-LatestArchive)})
+    if($script:PendingChange -and $script:ArchiveProcess){$SaveInfo.Text+=' | Another save queued'}
+    if($script:ArchiveProcess -and $script:WordHasUnsaved){$SaveInfo.Text+=' | Generating the earlier saved content'}
     $StatusValue.ForeColor = if ($Error) { [Drawing.SystemColors]::HotTrack } else { [Drawing.SystemColors]::WindowText }
     $ProgressBar.Visible = $null -ne $script:ArchiveProcess
 }
@@ -207,6 +235,12 @@ function Set-EditButtonsEnabled {
     $EditPrivateButton.Enabled = $Enabled
     $EditPublicButton.Enabled = $Enabled
     $SettingsButton.Enabled = $Enabled
+    $ProfilesButton.Enabled = $Enabled; $RecoveryButton.Enabled=$Enabled
+}
+
+function Update-ProfileCaption {
+    $Entry=@($script:ProfileEntries | Where-Object {$_.SettingsPath -eq $ConfigPath}) | Select-Object -First 1
+    $ProfileCaption.Text='Profile: '+$(if($Entry){$Entry.Name}else{'General'})
 }
 
 function Show-ManagerError([string]$Detail) {
@@ -282,6 +316,7 @@ function End-EditSession {
     $script:PendingChange = $false
     $script:ArchiveProcess = $null
     $script:WordClosed = $false
+    $script:WordHasUnsaved = $false
     $RetryButton.Visible = $false
     Set-EditButtonsEnabled -Enabled $true
     Set-Status -Text $Message
@@ -310,6 +345,7 @@ function Start-ArchiveProcess {
     if (-not (Test-ArchiveNeeded -CurrentHash $Hash -ArchivedHash $script:LastArchivedHash)) {
         $script:PendingChange = $false
         if ($script:WordClosed) { End-EditSession }
+        elseif(-not $ErrorPanel.Visible){Set-Status $(if($script:LastSavedAt){'Both versions saved at '+$script:LastSavedAt}else{'Editing '+$script:SessionKind+' resume'})}
         return
     }
     if ($Hash -eq $script:LastFailedHash) {
@@ -331,7 +367,7 @@ function Start-ArchiveProcess {
     $EscapedWorkflow = $WorkflowPath.Replace("'", "''")
     $EscapedSource = $SnapshotPath.Replace("'", "''")
     $EscapedConfig = $ConfigPath.Replace("'", "''")
-    $Command = "try { & '$EscapedWorkflow' -SourcePath '$EscapedSource' -ConfigPath '$EscapedConfig' -ProgressPath '$($script:ArchiveProgress.Replace("'","''"))'; exit 0 } catch { [Console]::Error.WriteLine(`$_); exit 1 }"
+    $Command = "`$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=New-Object Text.UTF8Encoding(`$false); `$env:PYTHONIOENCODING='utf-8'; try { & '$EscapedWorkflow' -SourcePath '$EscapedSource' -ConfigPath '$EscapedConfig' -ProgressPath '$($script:ArchiveProgress.Replace("'","''"))'; exit 0 } catch { [Console]::Error.WriteLine(`$_); exit 1 }"
     $Encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
 
     $script:ArchiveProcess = Start-Process -FilePath $PowerShellExe `
@@ -363,8 +399,8 @@ function Complete-ArchiveProcess {
     }
     $script:ArchiveProcess.WaitForExit()
     $ExitCode = $script:ArchiveProcess.ExitCode
-    $Output = if (Test-Path -LiteralPath $script:ArchiveStdout) { Get-Content -LiteralPath $script:ArchiveStdout -Raw } else { "" }
-    $Errors = if (Test-Path -LiteralPath $script:ArchiveStderr) { Get-Content -LiteralPath $script:ArchiveStderr -Raw } else { "" }
+    $Output = if (Test-Path -LiteralPath $script:ArchiveStdout) { Get-Content -LiteralPath $script:ArchiveStdout -Raw -Encoding UTF8 } else { "" }
+    $Errors = if (Test-Path -LiteralPath $script:ArchiveStderr) { Get-Content -LiteralPath $script:ArchiveStderr -Raw -Encoding UTF8 } else { "" }
     $script:ArchiveProcess.Dispose()
     $script:ArchiveProcess = $null
     $ProgressBar.Visible = $false
@@ -380,12 +416,16 @@ function Complete-ArchiveProcess {
     }
 
     $script:LastArchivedHash = $script:HashBeingArchived
+    $MetadataError=''
+    try{Save-SessionState}catch{$MetadataError='Versions saved, but the working-copy recovery record could not be updated: '+$_.Exception.Message}
     $script:LastFailedHash = $null
     $RetryButton.Visible = $false
     $ErrorPanel.Visible = $false
     $LatestValue.Text = Format-ArchiveDate (Get-LatestArchive)
     Update-PublicReview
-    Set-Status -Text "Version saved"
+    $script:LastSavedAt=Get-Date -Format 'h:mm:ss tt'
+    Set-Status -Text ('Both versions saved at '+$script:LastSavedAt)
+    if($MetadataError){Show-ManagerError $MetadataError}
     $WebsiteOutcome = @($Output -split "`n" | Where-Object {$_ -match 'Website copy|Updated website public resume'}) | Select-Object -Last 1
     if($WebsiteOutcome){$ReviewValue.Text += "`n" + $(if($WebsiteOutcome -match '^Updated website'){'Website copy updated.'}else{$WebsiteOutcome.Trim()})}
 
@@ -396,7 +436,7 @@ function Complete-ArchiveProcess {
             $script:LastFileEvent = [datetime]::UtcNow
         }
         elseif ($script:WordClosed) {
-            End-EditSession -Message "Version saved"
+            End-EditSession -Message ('Both versions saved at '+$script:LastSavedAt)
         }
     }
     catch {
@@ -408,7 +448,7 @@ function Complete-ArchiveProcess {
 function Start-EditSession {
     param([ValidateSet("Private", "Public")][string]$Kind)
 
-    if ($script:SessionActive) { return }
+    if (Test-ManagerBusy) { return }
     $Source = if ($Kind -eq "Private") { $CurrentPrivate } else { $CurrentPublic }
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
         [System.Windows.Forms.MessageBox]::Show("Resume not found:`n$Source", "Resume Manager") | Out-Null
@@ -428,8 +468,10 @@ function Start-EditSession {
         $script:LastSignature = "$($Item.Length)|$($Item.LastWriteTimeUtc.Ticks)"
         $script:PendingChange = $false
         $script:WordClosed = $false
+        $script:WordHasUnsaved = $false
         $script:LastFailedHash = $null
         $RetryButton.Visible = $false
+        Save-SessionState
 
         $script:Watcher = New-Object System.IO.FileSystemWatcher($script:WorkingDir, ([System.IO.Path]::GetFileName($script:WorkingPath)))
         $script:Watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite -bor [System.IO.NotifyFilters]::Size -bor [System.IO.NotifyFilters]::FileName
@@ -462,8 +504,12 @@ $EditPrivateButton.Add_Click({ Start-EditSession -Kind "Private" })
 $EditPublicButton.Add_Click({ Start-EditSession -Kind "Public" })
 $OpenCurrentButton.Add_Click({ Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $CurrentDir) })
 $OpenHistoryButton.Add_Click({ Show-HistoryDialog $Form })
+$ExportButton.Add_Click({try{Show-ExportDialog $Form}catch{Show-ManagerError $_.Exception.Message}})
+$RecoveryButton.Add_Click({try{Show-RecoveryDialog $Form}catch{Show-ManagerError $_.Exception.Message}})
+$ProfilesButton.Add_Click({try{Show-ProfilesDialog $Form}catch{Show-ManagerError $_.Exception.Message}})
+$AboutButton.Add_Click({Show-AboutDialog $Form})
 $SettingsButton.Add_Click({
-    if($script:SessionActive -or $null -ne $script:ArchiveProcess){return}
+    if(Test-ManagerBusy){return}
     if(Show-SettingsDialog $ConfigPath $Form){
         . (Join-Path $PSScriptRoot 'resume_settings.ps1') -ConfigPath $ConfigPath
         foreach($Name in @('Root','CurrentDir','UpdatesDir','PrivateName','PublicName','CurrentPrivate','CurrentPublic','CurrentPrivateName','CurrentPublicName','PythonExe','VariantScript','Settings','WebsitePublic')){Set-Variable -Name $Name -Scope Script -Value (Get-Variable -Name $Name -ValueOnly)}
@@ -488,6 +534,8 @@ $Timer.Interval = 750
 $Timer.Add_Tick({
     if (-not $script:SessionActive) { return }
 
+    if(-not $script:WordClosed){try{$script:WordHasUnsaved=-not $script:WordDocument.Saved}catch{}}
+
     if ($null -ne $script:ArchiveProcess) {
         Complete-ArchiveProcess
         return
@@ -504,6 +552,7 @@ $Timer.Add_Tick({
                 $script:Watcher.Filter = [IO.Path]::GetFileName($script:WorkingPath)
                 $script:Watcher.EnableRaisingEvents = $true
                 $script:LastSignature = $null
+                Save-SessionState
             }
         }
         catch {
@@ -512,6 +561,7 @@ $Timer.Add_Tick({
             $script:WordClosed = $true
         }
         if ($script:WordClosed) {
+            $script:WordHasUnsaved=$false
             Set-Status -Text "Waiting for Word"
             $script:PendingChange = $true
             $script:LastFileEvent = [datetime]::UtcNow.AddSeconds(-3)
@@ -535,7 +585,7 @@ $Timer.Add_Tick({
     }
 
     if (-not $script:PendingChange) {
-        if(-not $script:WordClosed -and -not $ErrorPanel.Visible){try{if(-not $script:WordDocument.Saved){Set-Status "Editing $script:SessionKind - unsaved changes in Word"}}catch{}}
+        if(-not $script:WordClosed -and -not $ErrorPanel.Visible){Set-Status $(if($script:WordHasUnsaved){'Unsaved changes in Word'}elseif($script:LastSavedAt){'Both versions saved at '+$script:LastSavedAt}else{'Editing '+$script:SessionKind+' resume'})}
         return
     }
     if (([datetime]::UtcNow - $script:LastFileEvent).TotalSeconds -lt 1.5) { return }
@@ -559,6 +609,8 @@ $Timer.Add_Tick({
 })
 $Timer.Start()
 Update-PublicReview
+Update-ProfileCaption
+Set-Status 'Ready'
 
 $Form.Add_FormClosing({
     param($Sender, $EventArgs)

@@ -123,4 +123,38 @@ with tempfile.TemporaryDirectory(prefix="resume-program-test-") as temp:
     except ValueError as error: assert 'Macro-enabled' in str(error)
     else: raise AssertionError('Disguised macro package was accepted')
 
-print("PASS: synthetic preservation, linked contact styles, shared-link privacy, fingerprints, and macro rejection")
+with tempfile.TemporaryDirectory(prefix='resume-export-test-') as temp:
+    directory = Path(temp)
+    example = directory/'example.docx'
+    program.create_example(example)
+    original = example.read_bytes()
+    assert program.inspect_contact(example)['Fields'][0] == 'public@example.com'
+    try: program.create_example(example)
+    except FileExistsError: pass
+    else: raise AssertionError('Example generation overwrote an existing file')
+    assert example.read_bytes() == original
+    config = directory/'settings.local.json'
+    config.write_text(json.dumps({'PrivateContact':'public@example.com | personal@example.com | 00000000000 | Example City',
+                                 'PublicContact':'public@example.com | Example City','ContactAnchor':'public@example.com',
+                                 'PrivateOnly':['personal@example.com','00000000000']}), encoding='utf-8')
+    program.load_settings(config)
+    for name, contact in ((program.PRIVATE_NAME,program.PRIVATE_CONTACT),(program.PUBLIC_NAME,program.PUBLIC_CONTACT)):
+        (directory/name).write_bytes(original); program.set_contact(directory/name,contact)
+    program.validate_variants(directory)
+    program.validate_export(directory/program.PRIVATE_NAME,'Private')
+    program.validate_export(directory/program.PUBLIC_NAME,'Public')
+    assert program.compare_text(directory/program.PUBLIC_NAME,directory/program.PUBLIC_NAME) == 'No body text changes.'
+    changed = directory/'changed.docx'
+    with ZipFile(directory/program.PUBLIC_NAME) as source, ZipFile(changed,'w') as destination:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename == 'word/document.xml': data = data.replace(b'Example Project',b'Updated Project')
+            destination.writestr(info,data)
+    assert '+Updated Project' in program.compare_text(directory/program.PUBLIC_NAME,changed)
+    with ZipFile(changed,'a') as package:
+        package.writestr('docProps/custom.xml',b'<properties><value>personal@example.com</value></properties>')
+    try: program.validate_export(changed,'Public')
+    except ValueError as error: assert 'private details' in str(error)
+    else: raise AssertionError('Hidden private contact escaped export validation')
+
+print("PASS: synthetic preservation, linked contact styles, privacy, fingerprints, macro rejection, example, export, and text comparison")

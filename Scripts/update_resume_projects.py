@@ -4,6 +4,7 @@ from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 import argparse
+import difflib
 import json
 import re
 from urllib.parse import unquote
@@ -313,6 +314,80 @@ def review(directory):
     return dict(pages, Checks='Configured contact checks passed; this is not an anonymity guarantee.', Warnings=list(dict.fromkeys(warnings)) or ['Review the public PDF before sharing.'])
 
 
+def validate_export(path, kind):
+    expected = PUBLIC_CONTACT if kind == 'Public' else PRIVATE_CONTACT
+    if path.suffix.lower() == '.docx':
+        check_source(path, strict=True)
+        with ZipFile(path) as package:
+            if text_of(contact_paragraph(parse_xml(package.read('word/document.xml')))) != expected:
+                raise ValueError('Export contact line does not match the active privacy settings')
+            for name in package.namelist():
+                if kind == 'Public' and name.endswith(('.xml', '.rels')):
+                    root = parse_xml(package.read(name))
+                    text = ''.join(root.itertext()) + ' '.join(value for e in root.iter() for value in e.attrib.values())
+                    if has_private_details(text):
+                        raise ValueError('Configured private details found in public DOCX export')
+    elif path.suffix.lower() == '.pdf':
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+        if not reader.pages or ''.join(expected.split()) not in ''.join(text.split()):
+            raise ValueError('Export PDF is missing its expected readable contact line')
+        if kind == 'Public' and has_private_details(text + str(reader.metadata)):
+            raise ValueError('Configured private details found in public PDF export')
+    else:
+        raise ValueError('Only DOCX and PDF exports are supported')
+
+
+def compare_text(first, second):
+    def lines(path):
+        check_source(path, strict=True)
+        with ZipFile(path) as package:
+            # ponytail: body text only; existing PDF previews cover visual/layout differences.
+            body = parse_xml(package.read('word/document.xml')).find(W+'body')
+            return [''.join(e.text or '' for e in p.iter() if e.tag in {W+'t', W+'delText'})
+                    for p in body.iter(W+'p')] if body is not None else []
+    return '\n'.join(difflib.unified_diff(lines(first), lines(second), fromfile=first.parent.name,
+                                         tofile=second.parent.name, lineterm='')) or 'No body text changes.'
+
+
+def create_example(path):
+    # A synthetic OOXML package avoids personal Normal.dotm templates and needs no new library.
+    paragraphs = [
+        ('Example Candidate', 44, True),
+        ('public@example.com | personal@example.com | Example City', 22, False),
+        ('Developer seeking an entry level role', 22, False),
+        ('Education', 24, True), ('Example University - Computing', 22, False),
+        ('Experience', 24, True), ('Built a local document versioning tool and tested recovery paths.', 22, False),
+        ('Projects', 24, True), ('Example Project - Python and native Windows tooling', 22, False),
+        ('Skills', 24, True), ('Python, PowerShell, Git, documentation', 22, False),
+    ]
+    root = etree.Element(W+'document', nsmap={'w': W[1:-1]})
+    body = etree.SubElement(root, W+'body')
+    for value, size, bold in paragraphs:
+        p = etree.SubElement(body, W+'p')
+        properties = etree.SubElement(p, W+'pPr')
+        etree.SubElement(properties, W+'spacing', {W+'after': '160'})
+        if value == 'Example Candidate':
+            etree.SubElement(properties, W+'pStyle', {W+'val': 'Title'})
+        run = etree.SubElement(p, W+'r'); style = etree.SubElement(run, W+'rPr')
+        etree.SubElement(style, W+'rFonts', {W+'ascii': 'Calibri', W+'hAnsi': 'Calibri'})
+        etree.SubElement(style, W+'sz', {W+'val': str(size)})
+        if bold: etree.SubElement(style, W+'b')
+        etree.SubElement(run, W+'t').text = value
+    section = etree.SubElement(body, W+'sectPr')
+    etree.SubElement(section, W+'pgSz', {W+'w': '12240', W+'h': '15840'})
+    etree.SubElement(section, W+'pgMar', {W+'top': '1080', W+'bottom': '1080', W+'left': '1080', W+'right': '1080'})
+    parts = {
+        '[Content_Types].xml': b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+        '_rels/.rels': b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+        'word/document.xml': etree.tostring(root, xml_declaration=True, encoding='UTF-8', standalone=True),
+    }
+    if path.suffix.lower() != '.docx': raise ValueError('Choose a DOCX filename')
+    with ZipFile(path, 'x') as package:
+        for name, data in parts.items(): package.writestr(name, data)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", nargs="?", type=Path)
@@ -324,17 +399,27 @@ def main():
     parser.add_argument('--review',type=Path)
     parser.add_argument('--inspect-contact',type=Path)
     parser.add_argument('--anchor')
+    parser.add_argument('--compare-text', nargs=2, type=Path)
+    parser.add_argument('--validate-export', type=Path)
+    parser.add_argument('--variant', choices=['Private', 'Public'], default='Public')
+    parser.add_argument('--create-example', type=Path)
     args = parser.parse_args()
     if args.fingerprint:
         print(fingerprint(args.fingerprint))
         return
     if args.inspect_contact:
         print(json.dumps(inspect_contact(args.inspect_contact,args.anchor))); return
+    if args.compare_text:
+        print(json.dumps(compare_text(*args.compare_text))); return
+    if args.create_example:
+        create_example(args.create_example); print('Synthetic example created'); return
     if not args.config:
         parser.error("--config must point to settings stored outside the program repository")
     load_settings(args.config)
     if args.validate_settings:
         print('Settings validated'); return
+    if args.validate_export:
+        validate_export(args.validate_export, args.variant); print('Export validated'); return
     if args.check_source:
         check_source(args.check_source,strict=True)
         with ZipFile(args.check_source) as package: contact_paragraph(parse_xml(package.read('word/document.xml')))
